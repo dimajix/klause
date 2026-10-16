@@ -108,7 +108,20 @@ example_config() {
 #IDLE_TIMEOUT=300
 
 # Additional mounts, space-separated: path, path:ro, source:target, source:target:ro
-#MOUNTS="~/.cargo/registry"
+# Repeated MOUNTS lines are concatenated. Sources that do not exist are skipped
+# with a warning. Sharing package caches with the host saves downloads:
+#   Maven (only the repository: ~/.m2/settings.xml may hold credentials)
+#MOUNTS="~/.m2/repository"
+#   Gradle
+#MOUNTS="~/.gradle/caches ~/.gradle/wrapper"
+#   npm, Yarn
+#MOUNTS="~/.npm ~/.cache/yarn"
+#   pip, Poetry, uv
+#MOUNTS="~/.cache/pip ~/.cache/pypoetry ~/.cache/uv"
+#   Cargo
+#MOUNTS="~/.cargo/registry ~/.cargo/git"
+#   Go
+#MOUNTS="~/go/pkg/mod ~/.cache/go-build"
 
 # Names of environment variables to pass into the container
 #PASS_ENV="ANTHROPIC_API_KEY"

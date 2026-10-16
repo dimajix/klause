@@ -97,12 +97,30 @@ concatenated.
 | `PASS_ENV`       |                 | Names of environment variables to pass through (e.g. `ANTHROPIC_API_KEY`) |
 | `CONTAINER_ARGS` |                 | Additional arguments for `docker create` |
 
-Example `~/.config/klause`:
+A key may appear several times in one file; for `MOUNTS`, `PASS_ENV` and
+`CONTAINER_ARGS` the lines are concatenated as well. Comments must be on lines
+of their own, not after a value.
+
+Example `~/.config/klause` that shares the typical package caches with the
+host (sources that do not exist are skipped with a warning):
 
 ```ini
-# Share the Cargo registry cache with the host
-MOUNTS="~/.cargo/registry"
+# Maven (only the repository: ~/.m2/settings.xml may hold credentials)
+MOUNTS="~/.m2/repository"
+# Gradle
+MOUNTS="~/.gradle/caches ~/.gradle/wrapper"
+# npm, Yarn
+MOUNTS="~/.npm ~/.cache/yarn"
+# pip, Poetry, uv
+MOUNTS="~/.cache/pip ~/.cache/pypoetry ~/.cache/uv"
+# Cargo
+MOUNTS="~/.cargo/registry ~/.cargo/git"
+# Go
+MOUNTS="~/go/pkg/mod ~/.cache/go-build"
 ```
+
+Note that the container can write to these caches, so a compromised build in
+the container could poison them for the host. Only share the caches you need.
 
 Example `.klause`:
 
