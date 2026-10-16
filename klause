@@ -1,0 +1,387 @@
+#!/usr/bin/env bash
+#
+# klause - Claude Code in a container hermitage
+#
+# Runs Claude Code in a container that persists per working directory.
+# The current directory is mounted under the same path, the process runs
+# with the caller's UID/GID/groups/umask. All arguments are passed
+# unchanged to claude; klause's own commands start with --klause-*.
+#
+# shellcheck disable=SC2016  # container scripts in single quotes are intentional
+set -euo pipefail
+
+readonly DEFAULT_IMAGE="klause:latest"
+SCRIPT_DIR="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
+readonly SCRIPT_DIR
+readonly GLOBAL_CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/klause"
+readonly PROJECT_CONFIG=".klause"
+
+die()  { printf 'klause: %s\n' "$*" >&2; exit 1; }
+warn() { printf 'klause: %s\n' "$*" >&2; }
+
+usage() {
+    cat <<EOF
+Usage: klause [claude-options...]
+       klause --klause-<command> [arguments...]
+
+Without a --klause command, all arguments are passed to claude in the container.
+
+Commands:
+  --klause-help         This help
+  --klause-build [...]  Build image ${DEFAULT_IMAGE} (further arguments are passed to "build")
+  --klause-shell        Bash in the container (as the caller)
+  --klause-root-shell   Bash in the container as root (e.g. for dnf install)
+  --klause-status       State of the container for this directory
+  --klause-list         List all klause containers
+  --klause-stop         Stop the container for this directory
+  --klause-rm           Delete the container for this directory (installed packages are lost)
+
+Configuration (KEY=VALUE):
+  global:  ${GLOBAL_CONFIG}
+  project: ./${PROJECT_CONFIG}
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+CFG_RUNTIME="docker"
+CFG_IMAGE="$DEFAULT_IMAGE"
+CFG_NETWORK="bridge"
+CFG_IDLE_TIMEOUT="300"
+CFG_MOUNTS=""           # additive: global + project
+CFG_PASS_ENV=""         # additive
+CFG_CONTAINER_ARGS=""   # additive
+
+# Reads a KEY=VALUE file. The file is not executed.
+load_config() {
+    local file=$1 line key val n=0
+    [[ -f $file ]] || return 0
+    while IFS= read -r line || [[ -n $line ]]; do
+        n=$((n + 1))
+        [[ $line =~ ^[[:space:]]*(#.*)?$ ]] && continue
+        if [[ ! $line =~ ^[[:space:]]*([A-Z_][A-Z0-9_]*)[[:space:]]*=[[:space:]]*(.*[^[:space:]])?[[:space:]]*$ ]]; then
+            warn "$file:$n: ignoring invalid line"
+            continue
+        fi
+        key=${BASH_REMATCH[1]}
+        val=${BASH_REMATCH[2]}
+        if [[ $val =~ ^\"(.*)\"$ || $val =~ ^\'(.*)\'$ ]]; then
+            val=${BASH_REMATCH[1]}
+        fi
+        case $key in
+            RUNTIME|IMAGE|NETWORK|IDLE_TIMEOUT)
+                printf -v "CFG_$key" '%s' "$val" ;;
+            MOUNTS|PASS_ENV|CONTAINER_ARGS)
+                local var="CFG_$key"
+                printf -v "$var" '%s' "${!var:+${!var} }$val" ;;
+            *)
+                warn "$file:$n: ignoring unknown key '$key'" ;;
+        esac
+    done < "$file"
+}
+
+load_config "$GLOBAL_CONFIG"
+load_config "$PROJECT_CONFIG"
+
+# Environment variables take precedence over the files
+CFG_RUNTIME=${KLAUSE_RUNTIME:-$CFG_RUNTIME}
+CFG_IMAGE=${KLAUSE_IMAGE:-$CFG_IMAGE}
+CFG_NETWORK=${KLAUSE_NETWORK:-$CFG_NETWORK}
+CFG_IDLE_TIMEOUT=${KLAUSE_IDLE_TIMEOUT:-$CFG_IDLE_TIMEOUT}
+
+case $CFG_RUNTIME in
+    docker|podman) ;;
+    *) die "RUNTIME must be 'docker' or 'podman', not '$CFG_RUNTIME'" ;;
+esac
+command -v "$CFG_RUNTIME" >/dev/null || die "'$CFG_RUNTIME' is not installed"
+[[ $CFG_IDLE_TIMEOUT =~ ^[0-9]+$ ]] || die "IDLE_TIMEOUT must be a number (seconds)"
+
+RT=$CFG_RUNTIME
+
+# ---------------------------------------------------------------------------
+# Identity and container name
+# ---------------------------------------------------------------------------
+
+WORKDIR=$(pwd -P)
+[[ $WORKDIR != / ]] || die "running klause in the root directory is not a good idea"
+[[ $WORKDIR != "$HOME" ]] || warn "Warning: the entire home directory is mounted into the container"
+
+USER_ID=$(id -u)
+GROUP_ID=$(id -g)
+USER_NAME=$(id -un)
+
+container_name() {
+    local base hash
+    base=$(basename -- "$WORKDIR")
+    base=$(printf '%s' "$base" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9_.-' '-')
+    base=${base#[-_.]}
+    base=${base:0:30}
+    hash=$(printf '%s' "$WORKDIR" | sha256sum | cut -c1-8)
+    printf 'klause-%s-%s' "${base:-x}" "$hash"
+}
+NAME=$(container_name)
+
+container_state() {
+    "$RT" container inspect -f '{{.State.Status}}' "$NAME" 2>/dev/null || true
+}
+
+# ---------------------------------------------------------------------------
+# Scripts that run inside the container (POSIX sh, so other images work too)
+# ---------------------------------------------------------------------------
+
+# Main process: exits (and thereby stops the container) when no "exec"
+# session has been running for IDLE_TIMEOUT seconds. Processes started via
+# exec are recognized by PPid 0 (their parent lies outside the PID namespace).
+readonly SUPERVISOR='
+timeout=$1 interval=10 idle=0
+trap "exit 0" TERM INT HUP
+while :; do
+    sleep "$interval" & wait $!
+    busy=
+    for f in /proc/[0-9]*/status; do
+        case $f in /proc/1/status|/proc/$$/status) continue ;; esac
+        while read -r k v; do
+            if [ "$k" = PPid: ]; then [ "$v" = 0 ] && busy=1; break; fi
+        done 2>/dev/null < "$f"
+        [ -n "$busy" ] && break
+    done
+    if [ -n "$busy" ]; then idle=0; else idle=$((idle + interval)); fi
+    if [ "$timeout" -gt 0 ] && [ "$idle" -ge "$timeout" ]; then exit 0; fi
+done'
+
+# Once, as root: create user, groups and home directory.
+# Arguments: uid gid user home gid:name...
+readonly SETUP='
+set -e
+uid=$1 gid=$2 user=$3 home=$4; shift 4
+has() { cut -d: -f"$2" "$1" | grep -qxF "$3"; }
+for pair in "$@"; do
+    g=${pair%%:*} n=${pair#*:}
+    if ! has /etc/group 3 "$g"; then
+        has /etc/group 1 "$n" && n="g$g"
+        echo "$n:x:$g:" >> /etc/group
+    fi
+done
+if has /etc/passwd 3 "$uid"; then
+    user=$(awk -F: -v u="$uid" "\$3 == u { print \$1; exit }" /etc/passwd)
+else
+    has /etc/passwd 1 "$user" && user="u$uid"
+    echo "$user:x:$uid:$gid::$home:/bin/bash" >> /etc/passwd
+fi
+for pair in "$@"; do
+    g=${pair%%:*}
+    [ "$g" = "$gid" ] && continue
+    sed -i -E "/^[^:]*:[^:]*:$g:/{ /[:,]$user(,|\$)/! { s/:\$/:$user/; t; s/\$/,$user/ } }" /etc/group
+done
+mkdir -p "$home"
+chmod 700 "$home"
+# Docker creates mount points below $home as root. Hand these (only those in
+# the container filesystem, never mounted host directories) to the user.
+rootdev=$(stat -c %d /)
+find "$home" -xdev -type d -user 0 2>/dev/null | while IFS= read -r d; do
+    [ "$(stat -c %d "$d")" = "$rootdev" ] && chown "$uid:$gid" "$d"
+done
+true'
+
+# ---------------------------------------------------------------------------
+# Create / start container
+# ---------------------------------------------------------------------------
+
+image_exists() { "$RT" image inspect "$1" >/dev/null 2>&1; }
+
+build_image() {
+    [[ -f $SCRIPT_DIR/Dockerfile ]] || die "no Dockerfile found in $SCRIPT_DIR"
+    "$RT" build -t "$DEFAULT_IMAGE" "$@" "$SCRIPT_DIR"
+}
+
+add_mount() {   # add_mount <host-path> <container-path> <ro|rw>
+    MOUNT_ARGS+=(-v "$1:$2:$3")
+}
+
+collect_mounts() {
+    MOUNT_ARGS=()
+    add_mount "$WORKDIR" "$WORKDIR" rw
+
+    add_mount "$HOME/.claude" "$HOME/.claude" rw
+    [[ -f $HOME/.gitconfig ]]   && add_mount "$HOME/.gitconfig" "$HOME/.gitconfig" ro
+    [[ -d $HOME/.config/git ]]  && add_mount "$HOME/.config/git" "$HOME/.config/git" ro
+
+    # MOUNTS: "path", "path:ro", "source:target" or "source:target:ro",
+    # separated by spaces. ~ is expanded, relative paths are relative to
+    # the working directory.
+    local entry src dst mode
+    local -a parts
+    for entry in $CFG_MOUNTS; do
+        IFS=: read -r -a parts <<< "$entry"
+        src=${parts[0]} dst="" mode=rw
+        case ${#parts[@]} in
+            1) ;;
+            2) if [[ ${parts[1]} == ro || ${parts[1]} == rw ]]; then mode=${parts[1]}; else dst=${parts[1]}; fi ;;
+            3) dst=${parts[1]} mode=${parts[2]} ;;
+            *) warn "MOUNTS: ignoring invalid entry '$entry'"; continue ;;
+        esac
+        [[ $mode == ro || $mode == rw ]] || { warn "MOUNTS: ignoring invalid mode in '$entry'"; continue; }
+        src=${src/#\~/$HOME}
+        dst=${dst/#\~/$HOME}
+        src=$(realpath -m -- "$src")
+        dst=${dst:-$src}
+        [[ -e $src ]] || { warn "MOUNTS: '$src' does not exist, ignored"; continue; }
+        add_mount "$src" "$dst" "$mode"
+    done
+}
+
+create_container() {
+    local -a args
+    collect_mounts
+    args=(
+        --name "$NAME"
+        --init
+        --user "$USER_ID:$GROUP_ID"
+        --network "$CFG_NETWORK"
+        --security-opt label=disable
+        "${MOUNT_ARGS[@]}"
+    )
+    [[ $CFG_NETWORK == host ]] || args+=(--hostname "klause")
+
+    local g
+    if [[ $RT == podman ]]; then
+        args+=(--userns=keep-id --group-add keep-groups)
+    else
+        for g in $(id -G); do
+            [[ $g == "$GROUP_ID" ]] || args+=(--group-add "$g")
+        done
+    fi
+
+    # shellcheck disable=SC2206  # word splitting is intentional here
+    args+=($CFG_CONTAINER_ARGS)
+
+    local hash
+    hash=$(printf '%s\0' "$CFG_IMAGE" "${args[@]}" "$CFG_IDLE_TIMEOUT" | sha256sum | cut -c1-16)
+    args+=(--label "klause.workdir=$WORKDIR" --label "klause.config=$hash")
+
+    "$RT" create "${args[@]}" "$CFG_IMAGE" sh -c "$SUPERVISOR" klause-supervisor "$CFG_IDLE_TIMEOUT" >/dev/null
+    "$RT" start "$NAME" >/dev/null
+
+    # Groups as "gid:name"; names like "domain users" are sanitized
+    local -a groups=()
+    local name
+    for g in $(id -G); do
+        name=$(getent group "$g" | cut -d: -f1 || true)
+        name=$(printf '%s' "${name:-g$g}" | tr -c 'A-Za-z0-9_.-' '_')
+        groups+=("$g:$name")
+    done
+    "$RT" exec -u 0 "$NAME" sh -c "$SETUP" klause-setup \
+        "$USER_ID" "$GROUP_ID" "$USER_NAME" "$HOME" "${groups[@]}"
+}
+
+# Hints when the existing container no longer matches the configuration.
+# Recreating a container discards installed packages, so only warn.
+check_container() {
+    local have want
+    have=$("$RT" container inspect -f '{{.Image}}' "$NAME" 2>/dev/null || true)
+    want=$("$RT" image inspect -f '{{.Id}}' "$CFG_IMAGE" 2>/dev/null || true)
+    if [[ -n $want && ${have#sha256:} != "${want#sha256:}" ]]; then
+        warn "Note: container uses an older version of $CFG_IMAGE (recreate with --klause-rm)"
+    fi
+}
+
+# Claude replaces ~/.claude.json via rename; a bind mount of the single file
+# would therefore become stale. In the container the file therefore lives in
+# ~/.claude (via CLAUDE_CONFIG_DIR) and is copied from the host the first time.
+prepare_claude_dir() {
+    mkdir -p -m 700 "$HOME/.claude"
+    if [[ ! -e $HOME/.claude/.claude.json && -f $HOME/.claude.json ]]; then
+        (umask 077 && cp "$HOME/.claude.json" "$HOME/.claude/.claude.json")
+    fi
+}
+
+ensure_running() {
+    local state
+    prepare_claude_dir
+    state=$(container_state)
+    if [[ -z $state ]]; then
+        if ! image_exists "$CFG_IMAGE" && [[ $CFG_IMAGE == "$DEFAULT_IMAGE" ]]; then
+            warn "Image $DEFAULT_IMAGE is missing, building ..."
+            build_image
+        fi
+        create_container
+        return
+    fi
+    check_container
+    case $state in
+        running) ;;
+        paused)  "$RT" unpause "$NAME" >/dev/null ;;
+        *)       "$RT" start "$NAME" >/dev/null ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
+# Execution
+# ---------------------------------------------------------------------------
+
+timezone() {
+    if [[ -n ${TZ:-} ]]; then
+        printf '%s' "$TZ"
+    else
+        readlink /etc/localtime 2>/dev/null | sed -n 's|.*/zoneinfo/||p'
+    fi
+}
+
+# run_in_container <user> <command> [arguments...]
+run_in_container() {
+    local user=$1; shift
+    local -a args=(exec -i -w "$WORKDIR" -u "$user")
+    [[ -t 0 && -t 1 ]] && args+=(-t)
+
+    local home=$HOME
+    [[ $user == 0 ]] && home=/root
+    args+=(
+        -e "HOME=$home" -e "USER=$USER_NAME" -e "LOGNAME=$USER_NAME"
+        -e "PATH=$home/.local/bin:$home/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin"
+        -e "TZ=$(timezone)"
+        -e "CLAUDE_CONFIG_DIR=$HOME/.claude"
+    )
+    local var
+    for var in TERM COLORTERM LANG LC_ALL $CFG_PASS_ENV; do
+        [[ -v $var ]] && args+=(-e "$var")
+    done
+
+    exec "$RT" "${args[@]}" "$NAME" sh -c 'umask "$1"; shift; exec "$@"' klause "$(umask)" "$@"
+}
+
+cmd_status() {
+    local state
+    state=$(container_state)
+    printf 'Container: %s\n' "$NAME"
+    printf 'Directory: %s\n' "$WORKDIR"
+    printf 'State:     %s\n' "${state:-not created}"
+    printf 'Image:     %s\n' "$CFG_IMAGE"
+    printf 'Runtime:   %s\n' "$RT"
+    printf 'Network:   %s\n' "$CFG_NETWORK"
+    [[ -n $state ]] && check_container
+    return 0
+}
+
+cmd_list() {
+    local fmt='{{.Names}}\t{{.Status}}\t{{.Label "klause.workdir"}}'
+    [[ $RT == podman ]] && fmt='{{.Names}}\t{{.Status}}\t{{index .Labels "klause.workdir"}}'
+    {
+        printf 'NAME\tSTATUS\tDIRECTORY\n'
+        "$RT" ps -a --filter label=klause.workdir --format "$fmt"
+    } | column -t -s $'\t'
+}
+
+case ${1:-} in
+    --klause-help)       usage ;;
+    --klause-build)      shift; build_image "$@" ;;
+    --klause-shell)      ensure_running; run_in_container "$USER_ID:$GROUP_ID" bash -l ;;
+    --klause-root-shell) ensure_running; run_in_container 0 bash -l ;;
+    --klause-status)     cmd_status ;;
+    --klause-list)       cmd_list ;;
+    --klause-stop)       [[ -n $(container_state) ]] && "$RT" stop "$NAME" >/dev/null; true ;;
+    --klause-rm)         [[ -n $(container_state) ]] && "$RT" rm -f "$NAME" >/dev/null; true ;;
+    --klause-*)          usage >&2; exit 2 ;;
+    *)                   ensure_running; run_in_container "$USER_ID:$GROUP_ID" claude "$@" ;;
+esac
