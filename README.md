@@ -137,7 +137,7 @@ MOUNTS="~/.gradle/caches ~/.gradle/wrapper"
 MOUNTS="~/.npm ~/.cache/yarn"
 # pip, Poetry, uv
 MOUNTS="~/.cache/pip ~/.cache/pypoetry ~/.cache/uv"
-#   Cargo and configuration; if it sets build.target-dir, mount that directory too
+# Cargo and configuration; if it sets build.target-dir, mount that directory too
 MOUNTS="~/.cargo/config.toml:ro ~/.cargo/registry ~/.cargo/git"
 # Go
 MOUNTS="~/go/pkg/mod ~/.cache/go-build"
