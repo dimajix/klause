@@ -33,6 +33,7 @@ klause --dangerously-skip-permissions    # ... this one too, if you want
   |----------------------|------|
   | Working directory    | rw   |
   | `~/.claude`          | rw   |
+  | `~/.claude/ide`      | ro   |
   | `~/.gitconfig`       | ro   |
   | `~/.config/git`      | ro   |
   | Entries from `MOUNTS`| as configured |
@@ -48,6 +49,29 @@ containers share this file, but it is independent of the host's. Login
 (`~/.claude/.credentials.json`), settings, hooks, plugins and sessions are
 shared anyway. To take it over from the host again, delete
 `~/.claude/.claude.json`.
+
+### IDE integration (PyCharm, VS Code, ...)
+
+IDE plugins can start `klause` instead of `claude` (in PyCharm: plugin setting
+for the Claude command). For claude in the container to connect to the IDE:
+
+- Set `NETWORK=host`, globally or in `.klause`, and recreate the container with
+  `klause --klause-rm`. claude connects to the IDE plugin via `127.0.0.1`, which
+  in a `bridge` container is the container itself. klause points this out when
+  started by an IDE.
+- klause passes the variables the plugin sets (`CLAUDE_CODE_SSE_PORT`,
+  `ENABLE_IDE_INTEGRATION`, `TERMINAL_EMULATOR`, `TERM_PROGRAM`,
+  `TERM_PROGRAM_VERSION`) into the container.
+- The IDE announces itself via a lock file in `~/.claude/ide` with its process
+  ID. claude deletes lock files whose process it cannot see, and from inside the
+  container that is every IDE. That would break the integration for claude on
+  the host too, so `~/.claude/ide` is mounted read-only.
+
+Limitation: when the IDE starts klause itself, claude finds the IDE by the port
+in `CLAUDE_CODE_SSE_PORT`. Running `klause` by hand in the IDE's terminal
+connects only if `CLAUDE_CODE_SSE_PORT` is set there as well. Otherwise claude
+checks that the IDE is one of its parent processes, which it cannot see in the
+container.
 
 ## Installation
 

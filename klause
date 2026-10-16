@@ -265,6 +265,10 @@ collect_mounts() {
     add_mount "$WORKDIR" "$WORKDIR" rw
 
     add_mount "$HOME/.claude" "$HOME/.claude" rw
+    # IDE plugins announce themselves via lock files in ~/.claude/ide. Claude
+    # deletes lock files whose IDE process it cannot see, which from inside
+    # the PID namespace are all of them. Read-only keeps them for the host.
+    add_mount "$HOME/.claude/ide" "$HOME/.claude/ide" ro
     [[ -f $HOME/.gitconfig ]]   && add_mount "$HOME/.gitconfig" "$HOME/.gitconfig" ro
     [[ -d $HOME/.config/git ]]  && add_mount "$HOME/.config/git" "$HOME/.config/git" ro
 
@@ -351,7 +355,7 @@ check_container() {
 # would therefore become stale. In the container the file therefore lives in
 # ~/.claude (via CLAUDE_CONFIG_DIR) and is copied from the host the first time.
 prepare_claude_dir() {
-    mkdir -p -m 700 "$HOME/.claude"
+    mkdir -p -m 700 "$HOME/.claude" "$HOME/.claude/ide"
     if [[ ! -e $HOME/.claude/.claude.json && -f $HOME/.claude.json ]]; then
         (umask 077 && cp "$HOME/.claude.json" "$HOME/.claude/.claude.json")
     fi
@@ -404,7 +408,10 @@ run_in_container() {
         -e "CLAUDE_CONFIG_DIR=$HOME/.claude"
     )
     local var
-    for var in TERM COLORTERM LANG LC_ALL $CFG_PASS_ENV; do
+    # The IDE variables let claude identify the terminal and the IDE to connect to
+    for var in TERM COLORTERM LANG LC_ALL \
+               TERM_PROGRAM TERM_PROGRAM_VERSION TERMINAL_EMULATOR \
+               CLAUDE_CODE_SSE_PORT ENABLE_IDE_INTEGRATION $CFG_PASS_ENV; do
         [[ -v $var ]] && args+=(-e "$var")
     done
 
@@ -443,5 +450,10 @@ case ${1:-} in
     --klause-stop)       [[ -n $(container_state) ]] && "$RT" stop "$NAME" >/dev/null; true ;;
     --klause-rm)         [[ -n $(container_state) ]] && "$RT" rm -f "$NAME" >/dev/null; true ;;
     --klause-*)          usage >&2; exit 2 ;;
-    *)                   ensure_running; run_in_container "$USER_ID:$GROUP_ID" claude "$@" ;;
+    *)
+        # claude connects to the IDE plugin via 127.0.0.1
+        if [[ -n ${CLAUDE_CODE_SSE_PORT:-} && $CFG_NETWORK != host ]]; then
+            warn "Note: IDE integration needs NETWORK=host (then recreate with --klause-rm)"
+        fi
+        ensure_running; run_in_container "$USER_ID:$GROUP_ID" claude "$@" ;;
 esac
