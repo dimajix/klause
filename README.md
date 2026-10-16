@@ -76,7 +76,8 @@ klause's own commands start with `--klause-` and are only recognized as the
 
 ## Configuration
 
-- global: `~/.config/klause` (or `$XDG_CONFIG_HOME/klause`)
+- global: `~/.config/klause` (or `$XDG_CONFIG_HOME/klause`). If the file
+  does not exist, klause creates it with a commented-out example of all keys.
 - per project: `.klause` in the current directory
 - the environment variables `KLAUSE_RUNTIME`, `KLAUSE_IMAGE`, `KLAUSE_NETWORK`,
   `KLAUSE_IDLE_TIMEOUT` take precedence

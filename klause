@@ -82,6 +82,53 @@ load_config() {
     done < "$file"
 }
 
+example_config() {
+    cat <<EOF
+# klause global configuration
+#
+# One KEY=VALUE per line, '#' starts a comment, values may be quoted.
+# This file is parsed, not executed. A .klause file in the working directory
+# overrides these settings; MOUNTS, PASS_ENV and CONTAINER_ARGS are
+# concatenated. The environment variables KLAUSE_RUNTIME, KLAUSE_IMAGE,
+# KLAUSE_NETWORK and KLAUSE_IDLE_TIMEOUT take precedence.
+#
+# Mounts, network, image and IDLE_TIMEOUT only apply to newly created
+# containers. After changing them, delete the container with "klause --klause-rm".
+
+# Container runtime: docker or podman (rootless)
+#RUNTIME=docker
+
+# Image to use; it needs sh and claude
+#IMAGE=${DEFAULT_IMAGE}
+
+# Network mode; "host" gives access to local services (e.g. MCP servers on localhost)
+#NETWORK=bridge
+
+# Seconds without an instance until the container stops; 0 = never
+#IDLE_TIMEOUT=300
+
+# Additional mounts, space-separated: path, path:ro, source:target, source:target:ro
+#MOUNTS="~/.cargo/registry"
+
+# Names of environment variables to pass into the container
+#PASS_ENV="ANTHROPIC_API_KEY"
+
+# Additional arguments for creating the container
+#CONTAINER_ARGS="--memory 8g"
+EOF
+}
+
+# Writes a commented example if no global configuration exists yet.
+create_global_config() {
+    [[ -e $GLOBAL_CONFIG || -L $GLOBAL_CONFIG ]] && return 0
+    if ! { mkdir -p -- "${GLOBAL_CONFIG%/*}" && (set -C; example_config > "$GLOBAL_CONFIG"); } 2>/dev/null; then
+        warn "could not create example configuration $GLOBAL_CONFIG"
+        return 0
+    fi
+    warn "created example configuration $GLOBAL_CONFIG"
+}
+
+create_global_config
 load_config "$GLOBAL_CONFIG"
 load_config "$PROJECT_CONFIG"
 
