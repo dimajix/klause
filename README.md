@@ -137,14 +137,21 @@ MOUNTS="~/.gradle/caches ~/.gradle/wrapper"
 MOUNTS="~/.npm ~/.cache/yarn"
 # pip, Poetry, uv
 MOUNTS="~/.cache/pip ~/.cache/pypoetry ~/.cache/uv"
-# Cargo
-MOUNTS="~/.cargo/registry ~/.cargo/git"
+#   Cargo and configuration; if it sets build.target-dir, mount that directory too
+MOUNTS="~/.cargo/config.toml:ro ~/.cargo/registry ~/.cargo/git"
 # Go
 MOUNTS="~/go/pkg/mod ~/.cache/go-build"
 ```
 
 Note that the container can write to these caches, so a compromised build in
 the container could poison them for the host. Only share the caches you need.
+
+Without `~/.cargo/config.toml`, cargo in the container ignores the host's
+configuration and, for example, builds into `./target` instead of a
+`build.target-dir` such as `/var/tmp/cargo-target`. If the configuration
+refers to tools like `mold` or `sccache`, they must be installed in the image
+as well. A single mounted file goes stale in the container when an editor
+replaces it on save; `klause --klause-stop` picks up the new version.
 
 Example `.klause`:
 
