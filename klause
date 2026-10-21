@@ -28,7 +28,10 @@ Without a --klause command, all arguments are passed to claude in the container.
 
 Commands:
   --klause-help         This help
-  --klause-build [...]  Build image ${DEFAULT_IMAGE} (further arguments are passed to "build")
+  --klause-build [...]  Build the project image from ./${PROJECT_CONFIG}/Dockerfile, otherwise
+                        ${DEFAULT_IMAGE} (further arguments are passed to "build")
+  --klause-build-base [...]
+                        Build image ${DEFAULT_IMAGE}, even if there is a project Dockerfile
   --klause-shell        Bash in the container (as the caller)
   --klause-root-shell   Bash in the container as root (e.g. for dnf install)
   --klause-status       State of the container for this directory
@@ -38,7 +41,7 @@ Commands:
 
 Configuration (KEY=VALUE):
   global:  ${GLOBAL_CONFIG}
-  project: ./${PROJECT_CONFIG}
+  project: ./${PROJECT_CONFIG} (file), or ./${PROJECT_CONFIG}/config next to an optional Dockerfile
 EOF
 }
 
@@ -87,10 +90,11 @@ example_config() {
 # klause global configuration
 #
 # One KEY=VALUE per line, '#' starts a comment, values may be quoted.
-# This file is parsed, not executed. A .klause file in the working directory
-# overrides these settings; MOUNTS, PASS_ENV and CONTAINER_ARGS are
-# concatenated. The environment variables KLAUSE_RUNTIME, KLAUSE_IMAGE,
-# KLAUSE_NETWORK and KLAUSE_IDLE_TIMEOUT take precedence.
+# This file is parsed, not executed. A project configuration in the working
+# directory (the file .klause, or .klause/config) overrides these settings;
+# MOUNTS, PASS_ENV and CONTAINER_ARGS are concatenated. The environment
+# variables KLAUSE_RUNTIME, KLAUSE_IMAGE, KLAUSE_NETWORK and
+# KLAUSE_IDLE_TIMEOUT take precedence.
 #
 # Mounts, network, image and IDLE_TIMEOUT only apply to newly created
 # containers. After changing them, delete the container with "klause --klause-rm".
@@ -98,7 +102,8 @@ example_config() {
 # Container runtime: docker or podman (rootless)
 #RUNTIME=docker
 
-# Image to use; it needs sh and claude
+# Image to use; it needs sh and claude. Projects with a .klause/Dockerfile
+# get it as build argument KLAUSE_IMAGE to build on.
 #IMAGE=${DEFAULT_IMAGE}
 
 # Network mode; "host" gives access to local services (e.g. MCP servers on localhost)
@@ -141,25 +146,6 @@ create_global_config() {
     warn "created example configuration $GLOBAL_CONFIG"
 }
 
-create_global_config
-load_config "$GLOBAL_CONFIG"
-load_config "$PROJECT_CONFIG"
-
-# Environment variables take precedence over the files
-CFG_RUNTIME=${KLAUSE_RUNTIME:-$CFG_RUNTIME}
-CFG_IMAGE=${KLAUSE_IMAGE:-$CFG_IMAGE}
-CFG_NETWORK=${KLAUSE_NETWORK:-$CFG_NETWORK}
-CFG_IDLE_TIMEOUT=${KLAUSE_IDLE_TIMEOUT:-$CFG_IDLE_TIMEOUT}
-
-case $CFG_RUNTIME in
-    docker|podman) ;;
-    *) die "RUNTIME must be 'docker' or 'podman', not '$CFG_RUNTIME'" ;;
-esac
-command -v "$CFG_RUNTIME" >/dev/null || die "'$CFG_RUNTIME' is not installed"
-[[ $CFG_IDLE_TIMEOUT =~ ^[0-9]+$ ]] || die "IDLE_TIMEOUT must be a number (seconds)"
-
-RT=$CFG_RUNTIME
-
 # ---------------------------------------------------------------------------
 # Identity and container name
 # ---------------------------------------------------------------------------
@@ -186,6 +172,61 @@ NAME=$(container_name)
 container_state() {
     "$RT" container inspect -f '{{.State.Status}}' "$NAME" 2>/dev/null || true
 }
+
+# Image names do not allow some separator sequences that container names do
+# (e.g. "a.-b"), so the project image only uses "-".
+project_image_name() {
+    printf '%s:latest' "$(printf '%s' "$NAME" | tr '._' '--')"
+}
+
+# ---------------------------------------------------------------------------
+# Load configuration
+# ---------------------------------------------------------------------------
+
+# .klause is either the configuration file itself, or a directory with the
+# configuration in .klause/config and optionally a Dockerfile for the project
+# image. The type is stored on the container, since .klause is mounted there.
+if [[ -d $PROJECT_CONFIG ]]; then
+    PROJECT_TYPE=dir
+    PROJECT_CONFIG_FILE=$PROJECT_CONFIG/config
+elif [[ -e $PROJECT_CONFIG ]]; then
+    PROJECT_TYPE=file
+    PROJECT_CONFIG_FILE=$PROJECT_CONFIG
+else
+    PROJECT_TYPE=none
+    PROJECT_CONFIG_FILE=""
+fi
+PROJECT_DOCKERFILE=""
+[[ $PROJECT_TYPE == dir && -f $PROJECT_CONFIG/Dockerfile ]] && PROJECT_DOCKERFILE=$PROJECT_CONFIG/Dockerfile
+
+create_global_config
+load_config "$GLOBAL_CONFIG"
+# The global IMAGE is the base for a project Dockerfile. IMAGE from the
+# project configuration is the image to use, or with a Dockerfile its tag.
+BASE_IMAGE=$CFG_IMAGE
+CFG_IMAGE=""
+[[ -n $PROJECT_CONFIG_FILE ]] && load_config "$PROJECT_CONFIG_FILE"
+
+if [[ -n $PROJECT_DOCKERFILE ]]; then
+    CFG_IMAGE=${KLAUSE_IMAGE:-${CFG_IMAGE:-$(project_image_name)}}
+    [[ $CFG_IMAGE != "$BASE_IMAGE" ]] || die "the project image must not be named like its base image $BASE_IMAGE"
+else
+    CFG_IMAGE=${KLAUSE_IMAGE:-${CFG_IMAGE:-$BASE_IMAGE}}
+fi
+
+# Environment variables take precedence over the files
+CFG_RUNTIME=${KLAUSE_RUNTIME:-$CFG_RUNTIME}
+CFG_NETWORK=${KLAUSE_NETWORK:-$CFG_NETWORK}
+CFG_IDLE_TIMEOUT=${KLAUSE_IDLE_TIMEOUT:-$CFG_IDLE_TIMEOUT}
+
+case $CFG_RUNTIME in
+    docker|podman) ;;
+    *) die "RUNTIME must be 'docker' or 'podman', not '$CFG_RUNTIME'" ;;
+esac
+command -v "$CFG_RUNTIME" >/dev/null || die "'$CFG_RUNTIME' is not installed"
+[[ $CFG_IDLE_TIMEOUT =~ ^[0-9]+$ ]] || die "IDLE_TIMEOUT must be a number (seconds)"
+
+RT=$CFG_RUNTIME
 
 # ---------------------------------------------------------------------------
 # Scripts that run inside the container (POSIX sh, so other images work too)
@@ -250,10 +291,44 @@ true'
 # ---------------------------------------------------------------------------
 
 image_exists() { "$RT" image inspect "$1" >/dev/null 2>&1; }
+image_id()     { "$RT" image inspect -f '{{.Id}}' "$1" 2>/dev/null || true; }
+image_label()  { "$RT" image inspect -f "{{index .Config.Labels \"$2\"}}" "$1" 2>/dev/null || true; }
 
-build_image() {
+build_base_image() {
     [[ -f $SCRIPT_DIR/Dockerfile ]] || die "no Dockerfile found in $SCRIPT_DIR"
     "$RT" build -t "$DEFAULT_IMAGE" "$@" "$SCRIPT_DIR"
+}
+
+# Hash over the build context .klause, without the configuration file
+project_context_hash() {
+    (cd -- "$PROJECT_CONFIG" && find . -path ./config -prune -o -type f -print0 \
+        | LC_ALL=C sort -z | xargs -0 -r sha256sum 2>/dev/null || true) | sha256sum | cut -c1-16
+}
+
+# The build context is .klause, not the whole project. The labels let
+# check_project_image detect changes to .klause and to the base image.
+build_project_image() {
+    if [[ $BASE_IMAGE == "$DEFAULT_IMAGE" ]] && ! image_exists "$BASE_IMAGE"; then
+        warn "Image $DEFAULT_IMAGE is missing, building ..."
+        build_base_image
+    fi
+    "$RT" build -t "$CFG_IMAGE" \
+        --build-arg "KLAUSE_IMAGE=$BASE_IMAGE" \
+        --label "klause.context=$(project_context_hash)" \
+        --label "klause.base=$(image_id "$BASE_IMAGE")" \
+        "$@" "$PROJECT_CONFIG"
+}
+
+# Hint when the project image no longer matches .klause or its base image
+check_project_image() {
+    [[ -n $PROJECT_DOCKERFILE ]] && image_exists "$CFG_IMAGE" || return 0
+    local have_base want_base
+    have_base=$(image_label "$CFG_IMAGE" klause.base)
+    want_base=$(image_id "$BASE_IMAGE")
+    if [[ $(image_label "$CFG_IMAGE" klause.context) != "$(project_context_hash)" ]] \
+        || [[ -n $have_base && -n $want_base && $have_base != "$want_base" ]]; then
+        warn "Note: $CFG_IMAGE is older than $PROJECT_CONFIG or $BASE_IMAGE (rebuild with --klause-build)"
+    fi
 }
 
 add_mount() {   # add_mount <host-path> <container-path> <ro|rw>
@@ -263,6 +338,8 @@ add_mount() {   # add_mount <host-path> <container-path> <ro|rw>
 collect_mounts() {
     MOUNT_ARGS=()
     add_mount "$WORKDIR" "$WORKDIR" rw
+    # Otherwise claude could change its own mounts, network and image
+    [[ $PROJECT_TYPE == none ]] || add_mount "$WORKDIR/$PROJECT_CONFIG" "$WORKDIR/$PROJECT_CONFIG" ro
 
     add_mount "$HOME/.claude" "$HOME/.claude" rw
     # IDE plugins announce themselves via lock files in ~/.claude/ide. Claude
@@ -323,7 +400,7 @@ create_container() {
 
     local hash
     hash=$(printf '%s\0' "$CFG_IMAGE" "${args[@]}" "$CFG_IDLE_TIMEOUT" | sha256sum | cut -c1-16)
-    args+=(--label "klause.workdir=$WORKDIR" --label "klause.config=$hash")
+    args+=(--label "klause.workdir=$WORKDIR" --label "klause.config=$hash" --label "klause.project=$PROJECT_TYPE")
 
     "$RT" create "${args[@]}" "$CFG_IMAGE" sh -c "$SUPERVISOR" klause-supervisor "$CFG_IDLE_TIMEOUT" >/dev/null
     "$RT" start "$NAME" >/dev/null
@@ -351,6 +428,25 @@ check_container() {
     fi
 }
 
+# .klause is mounted read-only, so the container must match its current type.
+# If .klause was removed, docker would recreate the mount source on start as
+# a directory owned by root. check_project_config [fatal]
+check_project_config() {
+    local have
+    have=$("$RT" container inspect -f '{{index .Config.Labels "klause.project"}}' "$NAME" 2>/dev/null || true)
+    [[ $have == "$PROJECT_TYPE" || ( -z $have && $PROJECT_TYPE == none ) ]] && return 0
+    if [[ -z $have ]]; then
+        warn "Note: $PROJECT_CONFIG is writable in this container from an older klause (recreate with --klause-rm)"
+    elif [[ $have == none ]]; then
+        warn "Note: $PROJECT_CONFIG was created after the container. If you did not create it yourself, check it."
+        warn "      It only applies after recreating the container with --klause-rm."
+    elif [[ -n ${1:-} ]]; then
+        die "$PROJECT_CONFIG was replaced or removed after the container was created (recreate with --klause-rm)"
+    else
+        warn "Note: $PROJECT_CONFIG was replaced or removed after the container was created (recreate with --klause-rm)"
+    fi
+}
+
 # Claude replaces ~/.claude.json via rename; a bind mount of the single file
 # would therefore become stale. In the container the file therefore lives in
 # ~/.claude (via CLAUDE_CONFIG_DIR) and is copied from the host the first time.
@@ -366,14 +462,20 @@ ensure_running() {
     prepare_claude_dir
     state=$(container_state)
     if [[ -z $state ]]; then
-        if ! image_exists "$CFG_IMAGE" && [[ $CFG_IMAGE == "$DEFAULT_IMAGE" ]]; then
+        if [[ -n $PROJECT_DOCKERFILE ]] && ! image_exists "$CFG_IMAGE"; then
+            warn "Image $CFG_IMAGE is missing, building from $PROJECT_DOCKERFILE ..."
+            build_project_image
+        elif [[ $CFG_IMAGE == "$DEFAULT_IMAGE" ]] && ! image_exists "$CFG_IMAGE"; then
             warn "Image $DEFAULT_IMAGE is missing, building ..."
-            build_image
+            build_base_image
         fi
+        check_project_image
         create_container
         return
     fi
+    check_project_image
     check_container
+    if [[ $state == running ]]; then check_project_config; else check_project_config fatal; fi
     case $state in
         running) ;;
         paused)  "$RT" unpause "$NAME" >/dev/null ;;
@@ -424,10 +526,13 @@ cmd_status() {
     printf 'Container: %s\n' "$NAME"
     printf 'Directory: %s\n' "$WORKDIR"
     printf 'State:     %s\n' "${state:-not created}"
+    printf 'Config:    %s\n' "${PROJECT_CONFIG_FILE:-none}"
     printf 'Image:     %s\n' "$CFG_IMAGE"
+    [[ -n $PROJECT_DOCKERFILE ]] && printf 'Base:      %s\n' "$BASE_IMAGE"
     printf 'Runtime:   %s\n' "$RT"
     printf 'Network:   %s\n' "$CFG_NETWORK"
-    [[ -n $state ]] && check_container
+    check_project_image
+    [[ -n $state ]] && check_container && check_project_config
     return 0
 }
 
@@ -442,7 +547,9 @@ cmd_list() {
 
 case ${1:-} in
     --klause-help)       usage ;;
-    --klause-build)      shift; build_image "$@" ;;
+    --klause-build)      shift
+                         if [[ -n $PROJECT_DOCKERFILE ]]; then build_project_image "$@"; else build_base_image "$@"; fi ;;
+    --klause-build-base) shift; build_base_image "$@" ;;
     --klause-shell)      ensure_running; run_in_container "$USER_ID:$GROUP_ID" bash -l ;;
     --klause-root-shell) ensure_running; run_in_container 0 bash -l ;;
     --klause-status)     cmd_status ;;

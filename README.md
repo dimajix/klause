@@ -32,6 +32,7 @@ klause --dangerously-skip-permissions    # ... this one too, if you want
   | Host                 | Mode |
   |----------------------|------|
   | Working directory    | rw   |
+  | `.klause` in it      | ro   |
   | `~/.claude`          | rw   |
   | `~/.claude/ide`      | ro   |
   | `~/.gitconfig`       | ro   |
@@ -90,7 +91,8 @@ klause's own commands start with `--klause-` and are only recognized as the
 | Command                 | Effect |
 |-------------------------|--------|
 | `--klause-help`         | Help |
-| `--klause-build [...]`  | Build image `klause:latest`; further arguments are passed to `docker build` (e.g. `--no-cache`, `--build-arg CLAUDE_CODE_VERSION=2.1.301`) |
+| `--klause-build [...]`  | Build the [project image](#project-image) if there is a `.klause/Dockerfile`, otherwise image `klause:latest`; further arguments are passed to `docker build` (e.g. `--no-cache`, `--build-arg CLAUDE_CODE_VERSION=2.1.301`) |
+| `--klause-build-base [...]` | Build image `klause:latest`, even in a project with its own Dockerfile |
 | `--klause-shell`        | Bash in the container as the caller |
 | `--klause-root-shell`   | Bash in the container as root, e.g. for `dnf install` |
 | `--klause-status`       | Name, state and configuration of the container for this directory |
@@ -102,7 +104,9 @@ klause's own commands start with `--klause-` and are only recognized as the
 
 - global: `~/.config/klause` (or `$XDG_CONFIG_HOME/klause`). If the file
   does not exist, klause creates it with a commented-out example of all keys.
-- per project: `.klause` in the current directory
+- per project: `.klause` in the current directory, either as a file or as a
+  directory with the configuration in `.klause/config` and optionally a
+  [Dockerfile](#project-image)
 - the environment variables `KLAUSE_RUNTIME`, `KLAUSE_IMAGE`, `KLAUSE_NETWORK`,
   `KLAUSE_IDLE_TIMEOUT` take precedence
 
@@ -114,7 +118,7 @@ concatenated.
 | Key              | Default         | Meaning |
 |------------------|-----------------|---------|
 | `RUNTIME`        | `docker`        | `docker` or `podman` (rootless, with `--userns=keep-id`) |
-| `IMAGE`          | `klause:latest` | Image to use. It needs `sh` and `claude`. Only `klause:latest` is built automatically when needed. |
+| `IMAGE`          | `klause:latest` | Image to use. It needs `sh` and `claude`. Only `klause:latest` and project images are built automatically when needed. With a project Dockerfile, the global `IMAGE` is the base image and the project `IMAGE` the tag of the project image. |
 | `NETWORK`        | `bridge`        | `host` gives access to local services (e.g. MCP servers on `localhost`) |
 | `IDLE_TIMEOUT`   | `300`           | Seconds without an instance until the container stops; `0` = never |
 | `MOUNTS`         |                 | Space-separated: `path`, `path:ro`, `source:target`, `source:target:ro`. `~` and relative paths are resolved. |
@@ -162,13 +166,57 @@ MOUNTS="~/data/testset:ro"
 ```
 
 **Caution:** A `.klause` in a third-party repository can weaken the isolation
-via `MOUNTS`, `NETWORK` or `CONTAINER_ARGS`. Check the file before you run
-`klause` in a third-party repo.
+via `MOUNTS`, `NETWORK` or `CONTAINER_ARGS`, and its Dockerfile runs arbitrary
+commands during the build. Check it before you run `klause` in a third-party
+repo.
+
+For the same reason, `.klause` is mounted **read-only** into the container, so
+claude cannot change its own mounts, network or image. The container remembers
+whether `.klause` was a file, a directory or missing when it was created:
+
+- If `.klause` appears afterwards (claude can create it if it did not exist),
+  klause points this out. Check it before you recreate the container.
+- If `.klause` was removed or replaced (e.g. file by directory), klause refuses
+  to start the stopped container until it is recreated with `klause --klause-rm`.
+  Docker would otherwise create the missing mount source as a directory owned
+  by root.
+
+### Project image
+
+If the project needs more than the default image (other toolchains, system
+packages, services), put a `Dockerfile` into the `.klause` directory:
+
+```
+.klause/
+├── config        # the former .klause file, optional
+└── Dockerfile
+```
+
+```dockerfile
+ARG KLAUSE_IMAGE=klause:latest
+FROM ${KLAUSE_IMAGE}
+RUN dnf -y install --setopt=install_weak_deps=False postgresql java-21-openjdk-devel \
+    && dnf clean all
+```
+
+- klause builds the image when it creates the container and the image is
+  missing, or with `klause --klause-build`. If needed, `klause:latest` is built
+  first.
+- The build argument `KLAUSE_IMAGE` is the global `IMAGE` (default
+  `klause:latest`), so the project image follows a different global base image.
+- The image is named after the container, `klause-<directory>-<hash>:latest`.
+  `IMAGE` in `.klause/config` overrides that name.
+- The build context is the `.klause` directory, not the project. Files for
+  `COPY` go next to the Dockerfile.
+- klause points out on start when the image is older than the files in
+  `.klause` (except `config`) or than its base image. It does not rebuild by
+  itself; rebuild with `klause --klause-build`, then recreate the container with
+  `klause --klause-rm`.
 
 ### When does a configuration change take effect?
 
-Mounts, network, image, groups and `IDLE_TIMEOUT` are fixed when the container
-is **created**. After a change, or after an image rebuild, the container has to
+Mounts, network, image, groups, `IDLE_TIMEOUT` and the type of `.klause` are
+fixed when the container is **created**. After a change, or after an image rebuild, the container has to
 be deleted with `klause --klause-rm`. Anything installed is lost in the
 process. If a newer image is available, klause points this out on start.
 `PASS_ENV` and all environment variables take effect immediately.
@@ -177,7 +225,7 @@ process. If a newer image is available, klause points this out on start.
 
 The bundled `Dockerfile` is based on Fedora and contains:
 
-- Claude Code (via npm, auto-updater disabled; update via `--klause-build --no-cache`)
+- Claude Code (via npm, auto-updater disabled; update via `--klause-build-base --no-cache`)
 - Python 3, pip, Poetry
 - Rust, Cargo, rustfmt, clippy, rust-analyzer (from the Fedora repos)
 - git, ripgrep, jq, gcc, make and common command-line tools
