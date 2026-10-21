@@ -5,7 +5,7 @@ FROM registry.fedoraproject.org/fedora:${FEDORA_VERSION}
 # Deliberately no sudo: root access is only available via "klause --klause-root-shell".
 RUN dnf -y install --setopt=install_weak_deps=False \
         bash-completion ca-certificates curl diffutils file findutils gawk \
-        git git-lfs gzip jq less make man-db openssh-clients patch procps-ng \
+        gh git git-lfs gzip jq less make man-db openssh-clients patch procps-ng \
         ripgrep sed tar unzip which xz zip \
         gcc gcc-c++ pkgconf-pkg-config openssl-devel \
         nodejs npm \

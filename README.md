@@ -229,6 +229,11 @@ The bundled `Dockerfile` is based on Fedora and contains:
 - Python 3, pip, Poetry
 - Rust, Cargo, rustfmt, clippy, rust-analyzer (from the Fedora repos)
 - git, ripgrep, jq, gcc, make and common command-line tools
+- GitHub CLI (`gh`). Its login is not shared with the host. Either pass a
+  token with `PASS_ENV="GH_TOKEN"`, or mount the host's login with
+  `MOUNTS="~/.config/gh"` (only works if the token is in `hosts.yml` and not in
+  the system keyring). Either way, claude in the container can then act on
+  GitHub with your permissions, so prefer a fine-grained token.
 
 ## Technical details
 
