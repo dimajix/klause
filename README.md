@@ -77,11 +77,29 @@ container.
 ## Installation
 
 ```sh
-ln -s "$PWD/klause" ~/.local/bin/klause
-klause --klause-build     # optional, otherwise happens on first start
+make install              # copies klause into ~/.local/bin (PREFIX=... for elsewhere)
+make                      # builds klause:latest; optional, otherwise happens on first start
 ```
 
-The Dockerfile is looked up next to the (resolved) script.
+`make install` copies the Dockerfile to `~/.local/share/klause`. klause looks
+for it next to the (resolved) script first, then in `../share/klause` relative
+to it. After changes to the repository, run `make install` again. To work on
+klause itself, link the script instead (`ln -s "$PWD/klause" ~/.local/bin/`);
+it then uses the Dockerfile in the repository.
+
+The Makefile calls `klause --klause-build-base`, so `RUNTIME` from the
+configuration applies.
+
+| Target                             | Effect |
+|------------------------------------|--------|
+| `make` / `make build`              | Build `klause:latest` |
+| `make update`                      | Rebuild with `--pull --no-cache`: latest Fedora packages and Claude Code |
+| `make CLAUDE_CODE_VERSION=2.1.301` | Pin the Claude Code version (also `FEDORA_VERSION=...`) |
+| `make install` / `make uninstall`  | Install or remove `$(PREFIX)/bin/klause` and `$(PREFIX)/share/klause/Dockerfile` (default `~/.local`, `DESTDIR` is supported) |
+| `make check`                       | `bash -n` and `shellcheck` on the script |
+
+Containers keep their image after a rebuild; recreate them with
+`klause --klause-rm` to use the new one.
 
 ## Commands
 
@@ -225,7 +243,7 @@ process. If a newer image is available, klause points this out on start.
 
 The bundled `Dockerfile` is based on Fedora and contains:
 
-- Claude Code (via npm, auto-updater disabled; update via `--klause-build-base --no-cache`)
+- Claude Code (via npm, auto-updater disabled; update via `make update`)
 - Python 3, pip, Poetry
 - Rust, Cargo, rustfmt, clippy, rust-analyzer (from the Fedora repos)
 - git, ripgrep, jq, gcc, make and common command-line tools

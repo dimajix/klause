@@ -294,9 +294,17 @@ image_exists() { "$RT" image inspect "$1" >/dev/null 2>&1; }
 image_id()     { "$RT" image inspect -f '{{.Id}}' "$1" 2>/dev/null || true; }
 image_label()  { "$RT" image inspect -f "{{index .Config.Labels \"$2\"}}" "$1" 2>/dev/null || true; }
 
+# The Dockerfile lies next to the script in the repository, and below
+# share/klause when installed with "make install".
 build_base_image() {
-    [[ -f $SCRIPT_DIR/Dockerfile ]] || die "no Dockerfile found in $SCRIPT_DIR"
-    "$RT" build -t "$DEFAULT_IMAGE" "$@" "$SCRIPT_DIR"
+    local dir
+    for dir in "$SCRIPT_DIR" "${SCRIPT_DIR%/*}/share/klause"; do
+        if [[ -f $dir/Dockerfile ]]; then
+            "$RT" build -t "$DEFAULT_IMAGE" "$@" "$dir"
+            return
+        fi
+    done
+    die "no Dockerfile found in $SCRIPT_DIR or ${SCRIPT_DIR%/*}/share/klause"
 }
 
 # Hash over the build context .klause, without the configuration file
