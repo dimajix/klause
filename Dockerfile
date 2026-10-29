@@ -9,7 +9,7 @@ RUN dnf -y install --setopt=install_weak_deps=False \
         ripgrep sed tar unzip which xz zip \
         gcc gcc-c++ pkgconf-pkg-config openssl-devel \
         nodejs npm \
-        python3 python3-pip python3-devel poetry \
+        python3 python3-pip python3-devel poetry uv \
         rust cargo rustfmt clippy rust-analyzer rust-src \
     && dnf clean all
 

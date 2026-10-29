@@ -244,7 +244,7 @@ process. If a newer image is available, klause points this out on start.
 The bundled `Dockerfile` is based on Fedora and contains:
 
 - Claude Code (via npm, auto-updater disabled; update via `make update`)
-- Python 3, pip, Poetry
+- Python 3, pip, Poetry, uv
 - Rust, Cargo, rustfmt, clippy, rust-analyzer (from the Fedora repos)
 - git, ripgrep, jq, gcc, make and common command-line tools
 - GitHub CLI (`gh`). Its login is not shared with the host. Either pass a
