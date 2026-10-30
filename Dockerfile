@@ -10,7 +10,7 @@ RUN dnf -y install --setopt=install_weak_deps=False \
         gcc gcc-c++ pkgconf-pkg-config openssl-devel \
         nodejs npm \
         python3 python3-pip python3-devel poetry uv \
-        rust cargo rustfmt clippy rust-analyzer rust-src \
+        rust rustup cargo rustfmt clippy rust-analyzer rust-src \
     && dnf clean all
 
 # Install Claude Code globally. Updates come via an image rebuild, not via
