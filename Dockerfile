@@ -12,6 +12,7 @@ RUN dnf -y install --setopt=install_weak_deps=False \
         ShellCheck \
         ffmpeg \
         python3 python3-pip python3-devel poetry uv \
+        golang gopls staticcheck golangci-lint golang-x-tools-goimports delve \
         rust rustup cargo rustfmt clippy rust-analyzer rust-src \
     && dnf clean all
 
