@@ -9,7 +9,7 @@ RUN dnf -y install --setopt=install_weak_deps=False \
         ripgrep sed tar unzip which xz zip \
         gcc gcc-c++ pkgconf-pkg-config openssl-devel \
         nodejs npm \
-        ShellCheck \
+        ShellCheck shfmt \
         ffmpeg \
         python3 python3-pip python3-devel poetry uv \
         golang gopls staticcheck golangci-lint golang-x-tools-goimports delve \
