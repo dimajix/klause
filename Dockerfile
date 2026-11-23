@@ -10,6 +10,7 @@ RUN dnf -y install --setopt=install_weak_deps=False \
         gcc gcc-c++ pkgconf-pkg-config openssl-devel \
         nodejs npm \
         ShellCheck shfmt \
+        php-cli php-xml php-mbstring composer \
         ffmpeg \
         python3 python3-pip python3-devel poetry uv \
         golang gopls staticcheck golangci-lint golang-x-tools-goimports delve \
