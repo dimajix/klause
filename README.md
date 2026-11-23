@@ -78,7 +78,7 @@ container.
 
 ```sh
 make install              # copies klause into ~/.local/bin (PREFIX=... for elsewhere)
-make                      # builds klause:latest; optional, otherwise happens on first start
+make                      # builds all images klause:<variant>; optional, otherwise each is built on first use
 ```
 
 `make install` copies the Dockerfile to `~/.local/share/klause`. klause looks
@@ -92,8 +92,9 @@ configuration applies.
 
 | Target                             | Effect |
 |------------------------------------|--------|
-| `make` / `make build`              | Build `klause:latest` |
-| `make update`                      | Rebuild with `--pull --no-cache`: latest Fedora packages and Claude Code |
+| `make` / `make build`              | Build all [images](#images) `klause:<variant>` |
+| `make IMAGES="shell python"`       | Build only these variants (also with `update`) |
+| `make update`                      | Rebuild with `--pull` and a new `CACHE_BUST`: latest Fedora packages and Claude Code |
 | `make CLAUDE_CODE_VERSION=2.1.301` | Pin the Claude Code version (also `FEDORA_VERSION=...`) |
 | `make install` / `make uninstall`  | Install or remove `$(PREFIX)/bin/klause` and `$(PREFIX)/share/klause/Dockerfile` (default `~/.local`, `DESTDIR` is supported) |
 | `make check`                       | `bash -n` and `shellcheck` on the script |
@@ -109,8 +110,8 @@ klause's own commands start with `--klause-` and are only recognized as the
 | Command                 | Effect |
 |-------------------------|--------|
 | `--klause-help`         | Help |
-| `--klause-build [...]`  | Build the [project image](#project-image) if there is a `.klause/Dockerfile`, otherwise image `klause:latest`; further arguments are passed to `docker build` (e.g. `--no-cache`, `--build-arg CLAUDE_CODE_VERSION=2.1.301`) |
-| `--klause-build-base [...]` | Build image `klause:latest`, even in a project with its own Dockerfile |
+| `--klause-build [...]`  | Build the [project image](#project-image) if there is a `.klause/Dockerfile`, otherwise the [image](#images) in use; further arguments are passed to `docker build` (e.g. `--build-arg CLAUDE_CODE_VERSION=2.1.301`) |
+| `--klause-build-base [variant] [...]` | Build image `klause:<variant>`, by default the one this directory uses or builds on, even in a project with its own Dockerfile |
 | `--klause-shell`        | Bash in the container as the caller |
 | `--klause-root-shell`   | Bash in the container as root, e.g. for `dnf install` |
 | `--klause-status`       | Name, state and configuration of the container for this directory |
@@ -136,7 +137,8 @@ concatenated.
 | Key              | Default         | Meaning |
 |------------------|-----------------|---------|
 | `RUNTIME`        | `docker`        | `docker` or `podman` (rootless, with `--userns=keep-id`) |
-| `IMAGE`          | `klause:latest` | Image to use. It needs `sh` and `claude`. Only `klause:latest` and project images are built automatically when needed. With a project Dockerfile, the global `IMAGE` is the base image and the project `IMAGE` the tag of the project image. |
+| `IMAGE`          | `klause:shell`  | Image to use. It needs `sh` and `claude`. Only the [bundled images](#images) `klause:<variant>` and project images are built automatically when needed. With a project Dockerfile, the project `IMAGE` is the tag of the project image. |
+| `BASE_IMAGE`     | `IMAGE` from the global configuration | Base image for a [project Dockerfile](#project-image), e.g. `klause:python`; ignored without one |
 | `NETWORK`        | `bridge`        | `host` gives access to local services (e.g. MCP servers on `localhost`) |
 | `IDLE_TIMEOUT`   | `300`           | Seconds without an instance until the container stops; `0` = never |
 | `MOUNTS`         |                 | Space-separated: `path`, `path:ro`, `source:target`, `source:target:ro`. `~` and relative paths are resolved. |
@@ -179,7 +181,7 @@ Example `.klause`:
 
 ```ini
 NETWORK=host
-IMAGE=klause:latest
+IMAGE=klause:python
 MOUNTS="~/data/testset:ro"
 ```
 
@@ -211,17 +213,19 @@ packages, services), put a `Dockerfile` into the `.klause` directory:
 ```
 
 ```dockerfile
-ARG KLAUSE_IMAGE=klause:latest
+ARG KLAUSE_IMAGE=klause:shell
 FROM ${KLAUSE_IMAGE}
 RUN dnf -y install --setopt=install_weak_deps=False postgresql java-21-openjdk-devel \
     && dnf clean all
 ```
 
 - klause builds the image when it creates the container and the image is
-  missing, or with `klause --klause-build`. If needed, `klause:latest` is built
+  missing, or with `klause --klause-build`. If needed, its base image is built
   first.
-- The build argument `KLAUSE_IMAGE` is the global `IMAGE` (default
-  `klause:latest`), so the project image follows a different global base image.
+- The build argument `KLAUSE_IMAGE` is `BASE_IMAGE`, by default the global
+  `IMAGE` (`klause:shell`). Select one of the [images](#images) in
+  `.klause/config`, e.g. `BASE_IMAGE=klause:rust`. `IMAGE` there would name the
+  project image, so klause refuses `IMAGE=klause:<variant>` with a Dockerfile.
 - The image is named after the container, `klause-<directory>-<hash>:latest`.
   `IMAGE` in `.klause/config` overrides that name.
 - The build context is the `.klause` directory, not the project. Files for
@@ -239,19 +243,39 @@ be deleted with `klause --klause-rm`. Anything installed is lost in the
 process. If a newer image is available, klause points this out on start.
 `PASS_ENV` and all environment variables take effect immediately.
 
-## Image
+## Images
 
-The bundled `Dockerfile` is based on Fedora and contains:
+The bundled `Dockerfile` is based on Fedora and builds several task-specific
+images as stages that build on each other. A project selects one with
+`IMAGE=klause:<variant>` in its `.klause`; without that, `klause:shell` is used.
+Common layers exist only once on disk, so all images together take about as
+much space as the largest one plus the variant-specific parts.
 
-- Claude Code (via npm, auto-updater disabled; update via `make update`)
-- Python 3, pip, Poetry, uv
-- Rust, Cargo, rustfmt, clippy, rust-analyzer (from the Fedora repos)
-- git, ripgrep, jq, gcc, make and common command-line tools
-- GitHub CLI (`gh`). Its login is not shared with the host. Either pass a
-  token with `PASS_ENV="GH_TOKEN"`, or mount the host's login with
-  `MOUNTS="~/.config/gh"` (only works if the token is in `hosts.yml` and not in
-  the system keyring). Either way, claude in the container can then act on
-  GitHub with your permissions, so prefer a fine-grained token.
+| Image           | Based on | Adds |
+|-----------------|----------|------|
+| `klause:shell`  | Fedora   | Claude Code (via npm, auto-updater disabled; update via `make update`), git, git-lfs, GitHub CLI, make, ripgrep, jq, ShellCheck, shfmt, Python 3 with pip, Node.js with npm, common command-line tools |
+| `klause:php`    | `shell`  | PHP (cli, xml, mbstring, mysqlnd), Composer |
+| `klause:devel`  | `shell`  | gcc, g++, pkg-config, OpenSSL headers; base for the following images |
+| `klause:python` | `devel`  | Python headers, Poetry, uv, ruff, ImageMagick, ffmpeg |
+| `klause:node`   | `devel`  | pnpm, Yarn (the C/C++ toolchain is for native modules) |
+| `klause:go`     | `node`   | Go, gopls, staticcheck, golangci-lint, goimports, delve |
+| `klause:rust`   | `node`   | Rust, Cargo, rustup, rustfmt, clippy, rust-analyzer, rust-src |
+
+Each image is built when a container needs it and it is missing, or with
+`klause --klause-build-base <variant>` or `make`. For more tools, add a
+[project Dockerfile](#project-image) on top of one of them, or install packages
+in the container via `--klause-root-shell`.
+
+`make update` passes a new build argument `CACHE_BUST` instead of
+`--no-cache`, so all images share the freshly built layers again. The value is
+stored as a label in the images, and klause passes it to later builds as well.
+With `--no-cache`, an image gets layers of its own.
+
+The GitHub CLI (`gh`) does not share its login with the host. Either pass a
+token with `PASS_ENV="GH_TOKEN"`, or mount the host's login with
+`MOUNTS="~/.config/gh"` (only works if the token is in `hosts.yml` and not in
+the system keyring). Either way, claude in the container can then act on
+GitHub with your permissions, so prefer a fine-grained token.
 
 ## Technical details
 

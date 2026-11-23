@@ -10,7 +10,7 @@
 # shellcheck disable=SC2016  # container scripts in single quotes are intentional
 set -euo pipefail
 
-readonly DEFAULT_IMAGE="klause:latest"
+readonly DEFAULT_IMAGE="klause:shell"
 SCRIPT_DIR="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
 readonly SCRIPT_DIR
 readonly GLOBAL_CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/klause"
@@ -29,15 +29,19 @@ Without a --klause command, all arguments are passed to claude in the container.
 Commands:
   --klause-help         This help
   --klause-build [...]  Build the project image from ./${PROJECT_CONFIG}/Dockerfile, otherwise
-                        ${DEFAULT_IMAGE} (further arguments are passed to "build")
-  --klause-build-base [...]
-                        Build image ${DEFAULT_IMAGE}, even if there is a project Dockerfile
+                        the klause image in use (further arguments are passed to "build")
+  --klause-build-base [variant] [...]
+                        Build image klause:<variant>, by default the one this directory
+                        uses or builds on, even if there is a project Dockerfile
   --klause-shell        Bash in the container (as the caller)
   --klause-root-shell   Bash in the container as root (e.g. for dnf install)
   --klause-status       State of the container for this directory
   --klause-list         List all klause containers
   --klause-stop         Stop the container for this directory
   --klause-rm           Delete the container for this directory (installed packages are lost)
+
+Images (IMAGE=klause:<variant>, default ${DEFAULT_IMAGE}):
+  $(klause_variants | sed 's/^/klause:/' | paste -sd ' ')
 
 Configuration (KEY=VALUE):
   global:  ${GLOBAL_CONFIG}
@@ -51,6 +55,7 @@ EOF
 
 CFG_RUNTIME="docker"
 CFG_IMAGE="$DEFAULT_IMAGE"
+CFG_BASE_IMAGE=""
 CFG_NETWORK="bridge"
 CFG_IDLE_TIMEOUT="300"
 CFG_MOUNTS=""           # additive: global + project
@@ -74,7 +79,7 @@ load_config() {
             val=${BASH_REMATCH[1]}
         fi
         case $key in
-            RUNTIME|IMAGE|NETWORK|IDLE_TIMEOUT)
+            RUNTIME|IMAGE|BASE_IMAGE|NETWORK|IDLE_TIMEOUT)
                 printf -v "CFG_$key" '%s' "$val" ;;
             MOUNTS|PASS_ENV|CONTAINER_ARGS)
                 local var="CFG_$key"
@@ -102,9 +107,14 @@ example_config() {
 # Container runtime: docker or podman (rootless)
 #RUNTIME=docker
 
-# Image to use; it needs sh and claude. Projects with a .klause/Dockerfile
-# get it as build argument KLAUSE_IMAGE to build on.
+# Image to use; it needs sh and claude. The bundled images are built when
+# needed: $(klause_variants | sed 's/^/klause:/' | paste -sd ' ')
+# A project selects one with IMAGE=klause:<variant> in its .klause.
 #IMAGE=${DEFAULT_IMAGE}
+
+# Base image for projects with a .klause/Dockerfile (build argument
+# KLAUSE_IMAGE); defaults to IMAGE. Usually set in the project's .klause/config.
+#BASE_IMAGE=klause:python
 
 # Network mode; "host" gives access to local services (e.g. MCP servers on localhost)
 #NETWORK=bridge
@@ -199,19 +209,54 @@ fi
 PROJECT_DOCKERFILE=""
 [[ $PROJECT_TYPE == dir && -f $PROJECT_CONFIG/Dockerfile ]] && PROJECT_DOCKERFILE=$PROJECT_CONFIG/Dockerfile
 
+# The bundled Dockerfile lies next to the script in the repository, and
+# below share/klause when installed with "make install".
+klause_dockerfile_dir() {
+    local dir
+    for dir in "$SCRIPT_DIR" "${SCRIPT_DIR%/*}/share/klause"; do
+        [[ -f $dir/Dockerfile ]] && { printf '%s' "$dir"; return 0; }
+    done
+    return 1
+}
+
+# Each stage of the bundled Dockerfile is a variant, built as klause:<variant>
+klause_variants() {
+    local dir
+    dir=$(klause_dockerfile_dir) || return 0
+    sed -nE 's/^FROM[[:space:]]+[^[:space:]]+[[:space:]]+AS[[:space:]]+([a-z0-9_.-]+)[[:space:]]*$/\1/Ip' "$dir/Dockerfile"
+}
+
+# Prints the variant if the image is one of the bundled klause:<variant>
+klause_variant() {
+    local variant=${1#klause:}
+    [[ $1 == klause:* && $'\n'$(klause_variants)$'\n' == *$'\n'"$variant"$'\n'* ]] || return 1
+    printf '%s' "$variant"
+}
+
+# Like klause_variant, but fails with a message for any other image
+require_variant() {
+    klause_variant "$1" \
+        || die "$1 is not a klause image ($(klause_variants | sed 's/^/klause:/' | paste -sd ' '))"
+}
+
 create_global_config
 load_config "$GLOBAL_CONFIG"
-# The global IMAGE is the base for a project Dockerfile. IMAGE from the
-# project configuration is the image to use, or with a Dockerfile its tag.
-BASE_IMAGE=$CFG_IMAGE
+# The global IMAGE is also the base for a project Dockerfile, unless
+# BASE_IMAGE is set. IMAGE from the project configuration is the image to
+# use, or with a Dockerfile its tag.
+GLOBAL_IMAGE=$CFG_IMAGE
 CFG_IMAGE=""
 [[ -n $PROJECT_CONFIG_FILE ]] && load_config "$PROJECT_CONFIG_FILE"
+BASE_IMAGE=${CFG_BASE_IMAGE:-$GLOBAL_IMAGE}
 
 if [[ -n $PROJECT_DOCKERFILE ]]; then
     CFG_IMAGE=${KLAUSE_IMAGE:-${CFG_IMAGE:-$(project_image_name)}}
     [[ $CFG_IMAGE != "$BASE_IMAGE" ]] || die "the project image must not be named like its base image $BASE_IMAGE"
+    if klause_variant "$CFG_IMAGE" >/dev/null; then
+        die "IMAGE=$CFG_IMAGE would overwrite that image with the project image; select the base of $PROJECT_DOCKERFILE with BASE_IMAGE=$CFG_IMAGE"
+    fi
 else
-    CFG_IMAGE=${KLAUSE_IMAGE:-${CFG_IMAGE:-$BASE_IMAGE}}
+    CFG_IMAGE=${KLAUSE_IMAGE:-${CFG_IMAGE:-$GLOBAL_IMAGE}}
 fi
 
 # Environment variables take precedence over the files
@@ -294,17 +339,31 @@ image_exists() { "$RT" image inspect "$1" >/dev/null 2>&1; }
 image_id()     { "$RT" image inspect -f '{{.Id}}' "$1" 2>/dev/null || true; }
 image_label()  { "$RT" image inspect -f "{{index .Config.Labels \"$2\"}}" "$1" 2>/dev/null || true; }
 
-# The Dockerfile lies next to the script in the repository, and below
-# share/klause when installed with "make install".
+# build_base_image <variant> [build arguments...]
+# The images share their layers only if all are built with the same
+# CACHE_BUST, so unless given, it is taken from the existing images.
 build_base_image() {
-    local dir
-    for dir in "$SCRIPT_DIR" "${SCRIPT_DIR%/*}/share/klause"; do
-        if [[ -f $dir/Dockerfile ]]; then
-            "$RT" build -t "$DEFAULT_IMAGE" "$@" "$dir"
-            return
-        fi
-    done
-    die "no Dockerfile found in $SCRIPT_DIR or ${SCRIPT_DIR%/*}/share/klause"
+    local variant=$1 dir v bust=""; shift
+    dir=$(klause_dockerfile_dir) || die "no Dockerfile found in $SCRIPT_DIR or ${SCRIPT_DIR%/*}/share/klause"
+    local -a args=(--target "$variant" -t "klause:$variant")
+    if [[ " $* " != *[\ =]CACHE_BUST=* ]]; then
+        for v in $(klause_variants); do
+            bust=$(image_label "klause:$v" klause.cache-bust)
+            [[ -z $bust ]] || break
+        done
+        [[ -z $bust ]] || args+=(--build-arg "CACHE_BUST=$bust")
+    fi
+    "$RT" build "${args[@]}" "$@" "$dir"
+}
+
+# Builds the image if it is a missing klause:<variant>; any other image is
+# left to the runtime (e.g. to pull it).
+build_if_missing() {
+    local variant
+    image_exists "$1" && return 0
+    variant=$(klause_variant "$1") || return 0
+    warn "Image $1 is missing, building ..."
+    build_base_image "$variant"
 }
 
 # Hash over the build context .klause, without the configuration file
@@ -316,10 +375,7 @@ project_context_hash() {
 # The build context is .klause, not the whole project. The labels let
 # check_project_image detect changes to .klause and to the base image.
 build_project_image() {
-    if [[ $BASE_IMAGE == "$DEFAULT_IMAGE" ]] && ! image_exists "$BASE_IMAGE"; then
-        warn "Image $DEFAULT_IMAGE is missing, building ..."
-        build_base_image
-    fi
+    build_if_missing "$BASE_IMAGE"
     "$RT" build -t "$CFG_IMAGE" \
         --build-arg "KLAUSE_IMAGE=$BASE_IMAGE" \
         --label "klause.context=$(project_context_hash)" \
@@ -473,9 +529,8 @@ ensure_running() {
         if [[ -n $PROJECT_DOCKERFILE ]] && ! image_exists "$CFG_IMAGE"; then
             warn "Image $CFG_IMAGE is missing, building from $PROJECT_DOCKERFILE ..."
             build_project_image
-        elif [[ $CFG_IMAGE == "$DEFAULT_IMAGE" ]] && ! image_exists "$CFG_IMAGE"; then
-            warn "Image $DEFAULT_IMAGE is missing, building ..."
-            build_base_image
+        else
+            build_if_missing "$CFG_IMAGE"
         fi
         check_project_image
         create_container
@@ -544,6 +599,21 @@ cmd_status() {
     return 0
 }
 
+# --klause-build-base [variant] [build arguments...]: build arguments start
+# with "-", so a first argument without one is the variant.
+cmd_build_base() {
+    local variant
+    if [[ -n ${1:-} && $1 != -* ]]; then
+        variant=$(require_variant "klause:$1") || exit 1
+        shift
+    elif [[ -n $PROJECT_DOCKERFILE ]]; then
+        variant=$(require_variant "$BASE_IMAGE") || exit 1
+    else
+        variant=$(require_variant "$CFG_IMAGE") || exit 1
+    fi
+    build_base_image "$variant" "$@"
+}
+
 cmd_list() {
     local fmt='{{.Names}}\t{{.Status}}\t{{.Label "klause.workdir"}}'
     [[ $RT == podman ]] && fmt='{{.Names}}\t{{.Status}}\t{{index .Labels "klause.workdir"}}'
@@ -556,8 +626,8 @@ cmd_list() {
 case ${1:-} in
     --klause-help)       usage ;;
     --klause-build)      shift
-                         if [[ -n $PROJECT_DOCKERFILE ]]; then build_project_image "$@"; else build_base_image "$@"; fi ;;
-    --klause-build-base) shift; build_base_image "$@" ;;
+                         if [[ -n $PROJECT_DOCKERFILE ]]; then build_project_image "$@"; else cmd_build_base "$@"; fi ;;
+    --klause-build-base) shift; cmd_build_base "$@" ;;
     --klause-shell)      ensure_running; run_in_container "$USER_ID:$GROUP_ID" bash -l ;;
     --klause-root-shell) ensure_running; run_in_container 0 bash -l ;;
     --klause-status)     cmd_status ;;
